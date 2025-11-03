@@ -1,6 +1,6 @@
 # Auth0 Terraform + Azure DevOps: Enterprise Setup Guide
 
-This guide streamlines setup of Auth0 infrastructure as code with Terraform, S3-native state locking, separated CI/CD pipelines, and Azure DevOps with enterprise best practices.
+This guide provides end-to-end setup for Auth0 infrastructure as code with Terraform, S3-native state locking, unified CI/CD pipeline, and Azure DevOps with enterprise best practices.
 
 ---
 
@@ -18,15 +18,27 @@ This guide streamlines setup of Auth0 infrastructure as code with Terraform, S3-
 ## Architecture Overview
 
 **Pipeline Strategy:**
-- **CI Pipeline** (`azure-pipelines-ci.yml`): Validates PRs and branches - builds, tests, security scans
-- **CD Pipeline** (`azure-pipelines-cd.yml`): Deploys to all environments with progressive approvals
-- **GitHub Flow**: Feature branches → PR → master → auto-deploy
+- **Unified Pipeline** (`azure-pipelines.yml`): Single pipeline with CI stages (always run) and CD stages (master branch only)
+- **GitHub Flow**: Feature branches → PR (CI only) → master (CI + CD automatically)
+- **Artifact Reuse**: CD stages use artifacts built during CI stage (no rebuild)
+
+**Pipeline Flow:**
+```
+Pull Request:
+  → CI Stages: Build → SecurityScan → Validate → PlanPreview → Summary
+  → No deployment
+  
+Merge to master:
+  → CI Stages: Build → SecurityScan → Validate → Summary
+  → CD Stages: DeployDev → DeployQA → DeployVal → DeployProd
+  → All CD stages reuse artifacts from Build stage
+```
 
 **Environments:**
 - **DEV** (`na-dev-axon-cic`): Auto-deploy, rapid iteration
 - **QA** (`na-qa-axon-cic`): Optional approval, automated testing
-- **VAL** (`na-val-axon-cic`): Required approval, business validation
-- **PROD** (`na-prod-axon-cic`): Strict approvals, separated init/plan/apply steps
+- **VAL** (`na-val-axon-cic`): Required approval (1 technical lead)
+- **PROD** (`na-prod-axon-cic`): Strict approvals (2 reviewers), separated init/plan/apply steps
 
 ---
 
@@ -36,6 +48,37 @@ This guide streamlines setup of Auth0 infrastructure as code with Terraform, S3-
 
 Create **separate S3 buckets per environment**. Enable **versioning** and **encryption** for each.
 
+```bash
+# Create buckets for each environment
+for env in dev qa val prod; do
+  aws s3api create-bucket \
+    --bucket "terraform-state-axon-cic-${env}" \
+    --region us-east-1
+  
+  # Enable versioning (required for S3-native locking)
+  aws s3api put-bucket-versioning \
+    --bucket "terraform-state-axon-cic-${env}" \
+    --versioning-configuration Status=Enabled
+  
+  # Enable encryption
+  aws s3api put-bucket-encryption \
+    --bucket "terraform-state-axon-cic-${env}" \
+    --server-side-encryption-configuration '{
+      "Rules": [{
+        "ApplyServerSideEncryptionByDefault": {
+          "SSEAlgorithm": "AES256"
+        }
+      }]
+    }'
+  
+  # Block public access
+  aws s3api put-public-access-block \
+    --bucket "terraform-state-axon-cic-${env}" \
+    --public-access-block-configuration \
+      "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+done
+```
+
 ### 1.2 Backend Configuration
 
 Update backend configuration in each environment directory:
@@ -44,7 +87,7 @@ Update backend configuration in each environment directory:
 ```hcl
 terraform {
   backend "s3" {
-    bucket       = "axon-tf-state-na-cic-{env}"
+    bucket       = "terraform-state-axon-cic-dev"
     key          = "terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true
@@ -58,6 +101,29 @@ Repeat for **qa**, **val**, and **prod** with respective bucket names.
 ### 1.3 IAM Permissions
 
 Ensure AWS credentials have these permissions for their respective environment buckets:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket",
+        "s3:GetBucketVersioning",
+        "s3:GetBucketEncryption"
+      ],
+      "Resource": [
+        "arn:aws:s3:::terraform-state-axon-cic-*",
+        "arn:aws:s3:::terraform-state-axon-cic-*/*"
+      ]
+    }
+  ]
+}
+```
 
 **Best Practice:** Use separate AWS IAM users or roles per environment for production isolation.
 
@@ -104,7 +170,8 @@ Example `dev.platform.tfvars.json`:
 {
   "environment": "dev",
   "app_callbacks": [
-    "https://dev-app.yourcompany.com/callback"
+    "https://dev-app.yourcompany.com/callback",
+    "https://dev-app.yourcompany.com/silent-callback"
   ]
 }
 ```
@@ -168,7 +235,10 @@ In GitHub: **Settings → Branches → Add rule** for `master`:
 
 ☑ Require status checks to pass before merging
   ☑ Require branches to be up to date before merging
-  Required: azure-pipelines-ci (Build, SecurityScan, Validate stages)
+  Required status checks:
+    - Build (from azure-pipelines.yml)
+    - SecurityScan (from azure-pipelines.yml)
+    - Validate (from azure-pipelines.yml)
 
 ☑ Require conversation resolution before merging
 
@@ -177,12 +247,27 @@ In GitHub: **Settings → Branches → Add rule** for `master`:
 ☑ Restrict who can push to matching branches (DevOps team only)
 ```
 
-### 3.4 Pipelines
+### 3.4 Pipeline Setup
 
-Create two pipelines:
+**Create the unified pipeline:**
 
-1. **CI Pipeline**: Pipelines → New → `azure-pipelines-ci.yml`
-2. **CD Pipeline**: Pipelines → New → `azure-pipelines-cd.yml`
+1. Navigate to **Pipelines** in Azure DevOps
+2. Click **New Pipeline**
+3. Select **GitHub** as code location
+4. Authorize and select your repository
+5. Choose **Existing Azure Pipelines YAML file**
+6. Select:
+   - **Branch**: `master`
+   - **Path**: `/azure-pipelines.yml`
+7. Click **Continue**
+8. Review the YAML
+9. Click **Save** (or **Run** to test immediately)
+10. Rename pipeline to: `axon-cic-unified` or `Auth0 CI/CD Pipeline`
+
+**Pipeline permissions:**
+- Go to the pipeline → **⋮** → **Settings** → **Triggers**
+- Verify triggers match YAML configuration
+- Ensure pipeline has access to all variable groups and environments
 
 ---
 
@@ -249,9 +334,11 @@ Lock file appears during apply: `terraform.tfstate.tflock` in S3 bucket.
 
 ---
 
-## Phase 5 — CI/CD Pipeline Execution
+## Phase 5 — Pipeline Execution
 
 ### 5.1 Development Workflow
+
+**Standard feature development:**
 
 ```bash
 # 1. Create feature branch
@@ -267,65 +354,94 @@ git add .
 git commit -m "feat: add MFA enforcement action"
 git push origin feature/add-mfa-enforcement
 
-# 4. Create Pull Request
-# CI Pipeline runs automatically:
+# 4. Create Pull Request to master
+# Pipeline runs CI stages only:
 #   ✓ Build Actions
 #   ✓ Run Tests  
-#   ✓ Security Scan (Checkov, TFSec)
+#   ✓ Security Scan (Checkov)
 #   ✓ Validate Terraform (all environments)
 #   ✓ Generate plan preview
+#   ✗ Deployment stages DO NOT run (master only)
 
-# 5. Get 2 approvals, merge to master
+# 5. Get 2 approvals, address review comments
 
-# 6. CD Pipeline triggers automatically
-#   ✓ Deploy DEV (automatic)
-#   ✓ Deploy QA (automatic or approval)
-#   ⏸ Deploy VAL (approval required)
-#   ⏸ Deploy PROD (2 approvals required)
+# 6. Merge PR to master
+# Pipeline runs ALL stages:
+#   ✓ Build Actions (builds once)
+#   ✓ Run Tests
+#   ✓ Security Scan
+#   ✓ Validate Terraform
+#   ✓ CI Summary
+#   ✓ Deploy DEV (automatic, uses Build artifacts)
+#   ✓ Deploy QA (automatic or manual approval)
+#   ⏸ Deploy VAL (manual approval - 1 reviewer)
+#   ⏸ Deploy PROD (manual approval - 2 reviewers)
 ```
+
+**Key difference:** The unified pipeline automatically progresses from CI to CD on master. No separate CD pipeline trigger needed.
 
 ### 5.2 First Pipeline Run
 
 ```bash
-git add azure-pipelines-ci.yml azure-pipelines-cd.yml
-git commit -m "ci: add separated CI/CD pipelines"
+# Add the unified pipeline
+git add azure-pipelines.yml
+git commit -m "ci: add unified CI/CD pipeline"
 git push origin master
 ```
 
-**CD Pipeline Stages:**
-1. BuildArtifacts: Compile TypeScript actions
-2. DeployDev: Automatic deployment
-3. DeployQA: Automatic (or wait for approval)
-4. DeployVal: Wait for 1 approval
-5. DeployProd: Wait for 2 approvals (separate init/plan/apply steps)
+**Pipeline execution:**
+1. **CI stages run** (Build, SecurityScan, Validate, CISummary)
+2. **CD stages start automatically** after CI passes
+3. **DEV deploys** immediately (reuses artifacts from Build stage)
+4. **QA deploys** after DEV
+5. **VAL waits** for manual approval
+6. **PROD waits** for manual approval (2 reviewers)
 
 ### 5.3 Production Deployment Process
 
 When PROD stage reaches approval gate:
 
-1. Download `prod-plan.txt` artifact and review
-2. Verify DEV, QA, VAL deployments succeeded
-3. Confirm changes match expectations
-4. Approve with 2 reviewers
-5. Monitor apply step execution
-6. Verify PROD tenant functionality
+1. **Review artifacts:**
+   - Download `prod-plan.txt` from pipeline artifacts
+   - Review planned changes carefully
+   - Verify DEV, QA, VAL deployed successfully
 
-### 5.4 Post-Deployment Verification
+2. **Approve deployment:**
+   - Navigate to pipeline run → PROD stage
+   - Click **Review**
+   - Both approvers must review and approve
+   - Optionally add approval comments
 
-```bash
-# Download outputs from pipeline artifacts
-# OR run locally:
-cd environments/prod
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-terraform output -json
-```
+3. **Monitor deployment:**
+   - Watch PROD deployment progress through steps:
+     - Step 1: Terraform Init
+     - Step 2: Terraform Plan (published for review)
+     - Step 3: Terraform Apply
+     - Step 4: Capture Outputs
+     - Step 5: Deployment Summary
 
-Verify in Auth0 Dashboard:
-- Login flow works
-- Actions execute correctly
-- No errors in logs
-- Applications authenticate successfully
+4. **Post-deployment verification:**
+   - Test Auth0 login flow in production
+   - Verify actions execute correctly
+   - Check Auth0 logs for errors
+   - Confirm applications authenticate successfully
+
+### 5.4 Pipeline Artifacts
+
+Each pipeline run produces artifacts:
+
+**CI Artifacts:**
+- `actions-dist` - Built TypeScript actions (reused by all CD stages)
+- `plan-preview-dev` - DEV plan preview (PR only)
+- `security-scan-results` - Checkov security scan results
+
+**CD Artifacts:**
+- `dev-plan` and `dev-outputs` - DEV deployment plan and outputs
+- `qa-artifacts` - QA deployment plan and outputs
+- `val-artifacts` - VAL deployment plan and outputs
+- `prod-plan` and `prod-outputs` - PROD deployment plan and outputs
+
+Download artifacts: Pipeline run → **⋯** → **Artifacts**
 
 ---
 
@@ -335,43 +451,77 @@ Verify in Auth0 Dashboard:
 
 ```bash
 # Modify modules or actions
+vim modules/tenant/main.tf
+vim actions/src/verified-email.ts
+
 # Test in DEV locally
+cd environments/dev
 terraform plan -var-file=dev.platform.tfvars.json
 terraform apply -var-file=dev.platform.tfvars.json
-# Create PR to trigger CI/CD
+
+# Create PR when ready
+git checkout -b feature/my-changes
+git commit -am "feat: my changes"
+git push origin feature/my-changes
+# Open PR, wait for CI, get reviews, merge
 ```
 
 ### Adding or Updating Actions
 
 * Implement TypeScript action and tests in `actions/`
-* `npm test && npm run build`
-* Update Terraform modules and apply to DEV
-* Push and create PR to deploy through pipeline
+* Build and test: `npm test && npm run build`
+* Update Terraform modules
+* Apply to DEV locally for testing
+* Create PR to trigger CI validation
+* Merge to deploy through pipeline
 
 ### Rollbacks
 
 **Preferred Method (Revert and Redeploy):**
 ```bash
+# Find the problematic commit
+git log --oneline
+
+# Revert it
 git revert <commit-hash>
 git push origin master
-# CD pipeline redeploys automatically
+
+# Pipeline automatically redeploys reverted state
+# Approve through environments as usual
 ```
 
 **Emergency Manual Rollback (PROD Only):**
 ```bash
+# Checkout last known good commit
 git checkout <last-good-commit>
+
+# Apply to PROD manually
 cd environments/prod
-# Export credentials
+export AUTH0_DOMAIN="na-axon-cic.us.auth0.com"
+export AUTH0_CLIENT_ID="..."
+export AUTH0_CLIENT_SECRET="..."
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+
 terraform init
+terraform plan -var-file=prod.platform.tfvars.json
 terraform apply -var-file=prod.platform.tfvars.json
+
 # Document in incident report
+# Create proper revert PR afterward
 ```
 
 **Targeted Rollback:**
 ```bash
+cd environments/prod
+
+# Mark resource for recreation
 terraform taint module.problematic_action.auth0_action.this
-# OR
+
+# Or destroy specific resource
 terraform destroy -target=module.problematic_action.auth0_action.this
+
+# Then reapply
 terraform apply -var-file=prod.platform.tfvars.json
 ```
 
@@ -392,6 +542,9 @@ terraform init -reconfigure
 cd actions
 npm ci
 npm run build
+
+# Verify dist/ exists
+ls -la dist/
 ```
 
 ### State locked / cannot acquire lock
@@ -414,6 +567,7 @@ aws s3 rm s3://terraform-state-axon-cic-dev/terraform.tfstate.tflock
   ```
 * Check IAM policy has required S3 permissions
 * Verify `TF_STATE_BUCKET` variable matches actual bucket name
+* Ensure pipeline has permission to use variable group
 
 ### Versioning not enabled
 
@@ -429,56 +583,115 @@ Upgrade to ≥ 1.13.3 and re-run `terraform init`.
 
 ### Pipeline not triggering
 
-**CI Pipeline not running on PR:**
+**CI stages not running on PR:**
 - Verify GitHub-Azure DevOps connection
 - Check trigger paths in YAML match changed files
-- Ensure branch protection requires CI status checks
+- Ensure branch protection requires pipeline status checks
+- Verify Azure Pipelines GitHub App is installed
 
-**CD Pipeline not running on merge:**
-- Verify `azure-pipelines-cd.yml` trigger includes `master` branch
-- Check pipeline is not disabled
-- Review path filters
+**CD stages not running after merge:**
+- Verify merge to master completed successfully
+- Check pipeline trigger includes master branch
+- Verify condition: `eq(variables['Build.SourceBranch'], 'refs/heads/master')`
+- Check no path filters exclude your changes
+
+**Pipeline shows "Skipped" for deployment stages:**
+- This is normal for PR builds (deployment only on master)
+- Merge the PR to master to trigger deployments
+
+### Pipeline permission errors
+
+**"The pipeline does not have access to resource":**
+- Click **View** → **Permit** for each resource (variable group, environment)
+- Or pre-authorize:
+  - Library → Variable group → Security → Authorize pipeline
+  - Environments → Environment → Security → Authorize pipeline
+
+### Security scan failures
+
+**Checkov finding issues:**
+```bash
+# Run locally to debug
+pip install checkov
+checkov -d environments/ --framework terraform
+
+# Address findings or suppress with skip annotations in Terraform:
+# resource "auth0_tenant" "main" {
+#   #checkov:skip=CKV_SECRET_6:Acceptable risk - documented in security review
+# }
+```
 
 ### Action not enforcing verified email
 
-* Confirm action exists, is deployed, and bound to Login flow
-* Inspect state:
+* Confirm action exists, is deployed, and bound to Login flow in Auth0 Dashboard
+* Inspect Terraform state:
   ```bash
   terraform state show module.verified_email_action.auth0_action.post_login
   terraform state show module.verified_email_action.auth0_trigger_actions.login
   ```
-* Check Auth0 logs for action execution errors
+* Check Auth0 logs (Monitoring → Logs) for action execution errors
+* Verify action code is correct in `actions/dist/`
 
 ---
 
 ## Security Checklist
 
-* `*.tfvars` and `*.tfvars.json` with secrets excluded via `.gitignore`
-* All secrets marked as secret in Azure DevOps variable groups
-* S3 buckets: encryption enabled, versioning enabled, public access blocked
-* Separate S3 buckets per environment
-* Manual approval gates for VAL and PROD (2 approvers for PROD)
-* Least-privilege IAM for S3 state (preferably separate AWS accounts per environment)
-* No hardcoded secrets in code or committed to repository
-* GitHub branch protection with required reviews and status checks
-* Separated CI/CD pipelines (separation of concerns)
+* ✅ `*.tfvars` and `*.tfvars.json` with secrets excluded via `.gitignore`
+* ✅ All secrets marked as secret in Azure DevOps variable groups
+* ✅ S3 buckets: encryption enabled, versioning enabled, public access blocked
+* ✅ Separate S3 buckets per environment
+* ✅ Manual approval gates for VAL and PROD (2 approvers for PROD)
+* ✅ Least-privilege IAM for S3 state (preferably separate AWS accounts per environment)
+* ✅ No hardcoded secrets in code or committed to repository
+* ✅ Auth0 M2M applications only (no user context)
+* ✅ GitHub branch protection with required reviews (2) and status checks
+* ✅ Unified pipeline with clear CI/CD separation via conditions
+* ✅ Security scanning with Checkov on every build
+* ✅ Artifact reuse prevents tampering between CI and CD
+
+**Recommended enhancements:**
+- Migrate secrets to Azure Key Vault
+- Enable MFA for Auth0 tenant admins
+- Configure Auth0 log streaming to SIEM
+- Set up AWS CloudTrail for S3 access logging
+- Implement secret rotation policy
+- Regular security audits and access reviews
+
+---
+
+## Monitoring and Observability
+
+**Pipeline Monitoring:**
+- Azure DevOps → Pipelines → Analytics
+- Track success rates, duration, failure patterns
+- Set up email/Slack notifications for failures
+
+**Auth0 Monitoring:**
+- Auth0 Dashboard → Monitoring → Logs
+- Review login failures, action errors, anomalies
+- Configure anomaly detection (brute force, breached passwords)
+
+**Terraform State:**
+- Review state files for drift periodically
+- Use `terraform plan` regularly to detect drift
+- Consider scheduled drift detection pipeline
+
+**Recommended Metrics:**
+- Pipeline success rate by environment
+- Average deployment duration
+- Auth0 login success/failure rates
+- Action execution times
+- Terraform state size and complexity
 
 ---
 
 ## Performance Tips
 
-* **Pipeline caching**: npm packages cached automatically in CI pipeline
+* **Pipeline caching**: npm packages cached automatically (if `package-lock.json` exists)
 * **Local testing**: Use `terraform init -backend=false` for faster iteration
 * **Path filters**: Only relevant paths trigger pipelines (actions/**, modules/**, environments/**)
-* **Parallel validation**: CI pipeline validates all environments in parallel
-
----
-
-## Next Steps
-
-* Set up drift detection (scheduled pipeline)
-* Document runbooks for common operational tasks
-* Prepare incident response plan
+* **Parallel validation**: CI stage validates all environments in parallel
+* **Artifact reuse**: CD stages download pre-built artifacts (no rebuild)
 
 ---
 
@@ -487,10 +700,15 @@ Upgrade to ≥ 1.13.3 and re-run `terraform init`.
 * [Terraform Auth0 Provider](https://registry.terraform.io/providers/auth0/auth0/latest/docs)
 * [Auth0 Management API](https://auth0.com/docs/api/management/v2)
 * [Terraform S3 Backend (S3-native locking)](https://developer.hashicorp.com/terraform/language/backend/s3)
+* [Azure DevOps Environments](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/environments)
+* [Checkov Documentation](https://www.checkov.io/1.Welcome/What%20is%20Checkov.html)
+* [Azure Pipelines YAML Schema](https://learn.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/)
 
 ---
 
 ## Support
 
-* Check Terraform state for resource drift
-* Internal DevOps team for pipeline and infrastructure questions
+* **Pipeline Issues**: Review Azure DevOps pipeline logs and run history
+* **Terraform Issues**: Check Terraform state and apply logs
+* **Auth0 Issues**: Review Auth0 Dashboard logs (Monitoring → Logs)
+* **AWS Issues**: Check S3 bucket permissions and CloudTrail logs

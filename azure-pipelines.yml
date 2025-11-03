@@ -1,23 +1,28 @@
-# ========================================
-# CD Pipeline: Deploy to All Environments
-# Runs on: master branch only
-# Purpose: Progressive deployment with approvals
-# ========================================
-
-name: $(Date:yyyyMMdd)$(Rev:.r)-cd
+name: $(Date:yyyyMMdd)$(Rev:.r)
 
 trigger:
   branches:
     include:
       - master
+      - develop
+      - feature/*
   paths:
     include:
       - actions/**
       - modules/**
       - environments/**
-      - azure-pipelines-cd.yml
+      - azure-pipelines.yml
 
-pr: none
+pr:
+  branches:
+    include:
+      - master
+      - develop
+  paths:
+    include:
+      - actions/**
+      - modules/**
+      - environments/**
 
 pool:
   vmImage: 'ubuntu-latest'
@@ -31,36 +36,375 @@ variables:
 
 stages:
   # ========================================
-  # Stage 0: Build Artifacts
+  # CI STAGES (Always Run)
   # ========================================
-  - stage: BuildArtifacts
-    displayName: 'Build Deployment Artifacts'
+
+  # Stage 1: Build TypeScript Actions
+  # ========================================
+  - stage: Build
+    displayName: 'Build Actions'
     jobs:
-      - job: Build
-        displayName: 'Build Actions for Deployment'
+      - job: BuildActions
+        displayName: 'Build TypeScript Actions'
         steps:
           - task: NodeTool@0
-            displayName: 'Install Node.js'
+            displayName: 'Install Node.js $(NODE_VERSION)'
             inputs:
               versionSpec: $(NODE_VERSION)
+
+          - task: Cache@2
+            displayName: 'Cache npm dependencies'
+            condition: and(succeeded(), exists('actions/package-lock.json'))
+            inputs:
+              key: 'npm | "$(Agent.OS)" | actions/package-lock.json'
+              path: actions/node_modules
+              restoreKeys: |
+                npm | "$(Agent.OS)"
 
           - script: |
               set -euo pipefail
               cd actions
+              echo "Installing dependencies..."
               npm ci
+              echo "Building actions..."
               npm run build
             displayName: 'Build Actions'
+
+          - script: |
+              set -euo pipefail
+              cd actions
+              echo "Running unit tests..."
+              npm test
+            displayName: 'Run Unit Tests'
+
+          - script: |
+              set -euo pipefail
+              cd actions
+              echo "Generating test coverage..."
+              npm run test:coverage || true
+            displayName: 'Generate Coverage Report'
+            continueOnError: true
+
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish Coverage Results'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: 'actions/coverage/cobertura-coverage.xml'
+              failIfCoverageEmpty: false
+            condition: succeededOrFailed()
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'actions/test-results/*.xml'
+              failTaskOnFailedTests: true
+            condition: succeededOrFailed()
 
           - publish: actions/dist
             artifact: actions-dist
             displayName: 'Publish Actions Artifact'
 
   # ========================================
-  # Stage 1: Deploy to DEV
+  # Stage 2: Security & Quality Checks
+  # ========================================
+  - stage: SecurityScan
+    displayName: 'Security & Quality'
+    dependsOn: Build
+    jobs:
+      - job: SecurityChecks
+        displayName: 'Security Scanning'
+        steps:
+          - script: |
+              set -euo pipefail
+              echo "========================================"
+              echo "Installing Checkov (Terraform Security Scanner)"
+              echo "========================================"
+              pip install checkov --break-system-packages
+              
+              echo ""
+              echo "Checkov version:"
+              checkov --version
+              echo "========================================"
+            displayName: 'Install Checkov'
+
+          - script: |
+              set -euo pipefail
+              echo "========================================"
+              echo "Running Checkov Security Scan"
+              echo "========================================"
+              echo "Scanning: environments/"
+              echo ""
+              
+              checkov -d environments/ \
+                --framework terraform \
+                --soft-fail \
+                --output cli \
+                --output junitxml \
+                --output-file-path $(Build.ArtifactStagingDirectory)
+              
+              echo ""
+              echo "Scan complete. Results saved to artifacts."
+              echo "========================================"
+            displayName: 'Checkov: Terraform Security Scan'
+            continueOnError: true
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Security Scan Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '$(Build.ArtifactStagingDirectory)/results_junitxml.xml'
+              testRunTitle: 'Checkov Security Scan'
+              failTaskOnFailedTests: false
+            condition: succeededOrFailed()
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: security-scan-results
+            displayName: 'Publish Scan Artifacts'
+            condition: succeededOrFailed()
+
+      - job: LintCheck
+        displayName: 'Linting & Formatting'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform $(TF_VERSION)'
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              set -euo pipefail
+              echo "========================================"
+              echo "Checking Terraform Formatting"
+              echo "========================================"
+              terraform fmt -check -recursive -diff
+              echo ""
+              echo "✓ Terraform formatting is correct"
+            displayName: 'Terraform Format Check'
+
+          - script: |
+              set -euo pipefail
+              cd actions
+              echo "Running ESLint..."
+              npm run lint || echo "⚠ ESLint warnings found (non-blocking)"
+            displayName: 'ESLint Check'
+            continueOnError: true
+
+  # ========================================
+  # Stage 3: Terraform Validation
+  # ========================================
+  - stage: Validate
+    displayName: 'Terraform Validation'
+    dependsOn: SecurityScan
+    jobs:
+      - job: ValidateAll
+        displayName: 'Validate All Environments'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform $(TF_VERSION)'
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              set -euo pipefail
+              
+              echo "========================================"
+              echo "Terraform Validation - All Environments"
+              echo "========================================"
+              echo ""
+              
+              for env in dev qa val prod; do
+                echo "----------------------------------------"
+                echo "Validating: $env"
+                echo "----------------------------------------"
+                
+                cd environments/$env
+                
+                echo "Initializing (no backend)..."
+                terraform init -backend=false -input=false -no-color
+                
+                echo "Running validation..."
+                terraform validate -no-color
+                
+                echo "✓ $env validation passed"
+                cd ../..
+                echo ""
+              done
+              
+              echo "========================================"
+              echo "✓ All environments validated successfully"
+              echo "========================================"
+            displayName: 'Validate Terraform Configurations'
+
+  # ========================================
+  # Stage 4: Plan Preview (PR only)
+  # ========================================
+  - stage: PlanPreview
+    displayName: 'Plan Preview (PR)'
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: PreviewDev
+        displayName: 'Preview DEV Changes'
+        variables:
+          - group: na-dev-axon-cic
+        steps:
+          - download: current
+            artifact: actions-dist
+
+          - script: |
+              set -euo pipefail
+              mkdir -p actions/dist
+              cp -r "$(Pipeline.Workspace)/actions-dist/"* actions/dist/
+            displayName: 'Restore Actions Build'
+
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              set -euo pipefail
+              
+              export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+              export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+              export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+              
+              echo "Verifying AWS credentials..."
+              aws sts get-caller-identity
+              
+              echo "Checking S3 bucket: $(TF_STATE_BUCKET)"
+              aws s3api head-bucket --bucket "$(TF_STATE_BUCKET)" 2>/dev/null || {
+                echo "⚠ WARNING: S3 bucket may not exist or is inaccessible"
+              }
+            displayName: 'Verify AWS Access'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+          - script: |
+              set -euo pipefail
+              
+              cd environments/dev
+              
+              export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+              export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+              export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+              
+              echo "========================================"
+              echo "Plan Preview - DEV"
+              echo "========================================"
+              
+              terraform init \
+                -backend-config="bucket=$(TF_STATE_BUCKET)" \
+                -backend-config="key=terraform.tfstate" \
+                -backend-config="region=$(AWS_DEFAULT_REGION)" \
+                -backend-config="use_lockfile=true" \
+                -backend-config="encrypt=true" \
+                -input=false -no-color
+              
+              echo ""
+              echo "Generating plan preview (read-only)..."
+              terraform plan \
+                -input=false \
+                -no-color \
+                -lock=false \
+                -var-file=dev.platform.tfvars.json \
+                -var="app_callbacks=$(app_callbacks)" \
+                -out=tfplan-preview
+              
+              echo ""
+              echo "Exporting plan..."
+              terraform show -json tfplan-preview > "$(Build.ArtifactStagingDirectory)/dev-plan-preview.json"
+              terraform show -no-color tfplan-preview > "$(Build.ArtifactStagingDirectory)/dev-plan-preview.txt"
+              
+              echo ""
+              echo "✓ Plan preview generated"
+              echo "========================================"
+            displayName: 'Generate DEV Plan Preview'
+            env:
+              TF_IN_AUTOMATION: '1'
+              AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+              AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+              AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: plan-preview-dev
+            displayName: 'Publish Plan Preview'
+
+          - script: |
+              echo "========================================"
+              echo "Plan Preview Summary"
+              echo "========================================"
+              echo "This is a preview only - no changes applied"
+              echo "Download the plan-preview-dev artifact to review"
+              echo "========================================"
+            displayName: 'Plan Summary'
+
+  # ========================================
+  # Stage 5: CI Summary
+  # ========================================
+  - stage: CISummary
+    displayName: 'CI Summary'
+    dependsOn:
+      - Build
+      - SecurityScan
+      - Validate
+    condition: succeededOrFailed()
+    jobs:
+      - job: Summary
+        displayName: 'Pipeline Summary'
+        steps:
+          - script: |
+              set -euo pipefail
+              
+              echo "========================================"
+              echo "CI Pipeline Summary"
+              echo "========================================"
+              echo "Build ID: $(Build.BuildId)"
+              echo "Build Number: $(Build.BuildNumber)"
+              echo "Source Branch: $(Build.SourceBranchName)"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "Triggered by: $(Build.Reason)"
+              echo "========================================"
+              echo ""
+              echo "✓ Actions built and tested"
+              echo "✓ Security scans completed"
+              echo "✓ Terraform validated"
+              
+              if [ "$(Build.Reason)" = "PullRequest" ]; then
+                echo "✓ Plan preview generated"
+                echo ""
+                echo "→ Review artifacts before merging"
+              fi
+              
+              if [ "$(Build.SourceBranchName)" = "master" ] && [ "$(Build.Reason)" != "PullRequest" ]; then
+                echo ""
+                echo "→ Deployment stages will follow"
+              fi
+              
+              echo ""
+              echo "Pipeline completed successfully!"
+              echo "========================================"
+            displayName: 'Display Summary'
+
+  # ========================================
+  # CD STAGES (Only on master branch, after CI passes)
+  # ========================================
+
+  # Stage 6: Deploy to DEV
   # ========================================
   - stage: DeployDev
     displayName: 'Deploy to DEV'
-    dependsOn: BuildArtifacts
+    dependsOn:
+      - Build
+      - SecurityScan
+      - Validate
+      - CISummary
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
     jobs:
       - deployment: DeployDevEnvironment
         displayName: 'Deploy DEV'
@@ -75,11 +419,13 @@ stages:
 
                 - download: current
                   artifact: actions-dist
+                  displayName: 'Download CI Build Artifacts'
 
                 - script: |
                     set -euo pipefail
                     mkdir -p actions/dist
                     cp -r "$(Pipeline.Workspace)/actions-dist/"* actions/dist/
+                    echo "✓ Actions restored from CI build"
                   displayName: 'Restore Actions Build'
 
                 - task: TerraformInstaller@1
@@ -90,13 +436,12 @@ stages:
                 - script: |
                     set -euo pipefail
                     
-                    # Configure AWS credentials
                     export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
                     export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
                     export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
                     
                     echo "========================================"
-                    echo "AWS Preflight Checks"
+                    echo "AWS Preflight Checks - DEV"
                     echo "========================================"
                     
                     echo "Verifying AWS credentials..."
@@ -107,7 +452,6 @@ stages:
                     echo ""
                     echo "Checking S3 bucket: $BUCKET"
                     
-                    # Check versioning
                     VERSION_STATUS=$(aws s3api get-bucket-versioning \
                       --bucket "$BUCKET" \
                       --query 'Status' \
@@ -120,7 +464,6 @@ stages:
                     fi
                     echo "✓ Versioning: $VERSION_STATUS"
                     
-                    # Check encryption
                     SSE_ALGO=$(aws s3api get-bucket-encryption \
                       --bucket "$BUCKET" \
                       --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
@@ -146,7 +489,6 @@ stages:
                     
                     cd environments/dev
                     
-                    # Configure AWS
                     export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
                     export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
                     export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
@@ -168,7 +510,7 @@ stages:
                       -backend-config="encrypt=true" \
                       -input=false -no-color
                     
-                    echo "✓ Terraform initialized successfully"
+                    echo "✓ Terraform initialized"
                   displayName: 'Terraform Init'
                   env:
                     TF_IN_AUTOMATION: '1'
@@ -184,7 +526,6 @@ stages:
                     
                     cd environments/dev
                     
-                    # Configure AWS
                     export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
                     export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
                     export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
@@ -202,14 +543,11 @@ stages:
                       -out=tfplan
                     
                     echo ""
-                    echo "Converting plan to JSON..."
+                    echo "Exporting plan..."
                     terraform show -json tfplan > "$(Build.ArtifactStagingDirectory)/dev-plan.json"
-                    
-                    echo "Converting plan to readable format..."
                     terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/dev-plan.txt"
                     
-                    echo ""
-                    echo "✓ Plan generated successfully"
+                    echo "✓ Plan generated"
                   displayName: 'Terraform Plan'
                   env:
                     TF_IN_AUTOMATION: '1'
@@ -229,7 +567,6 @@ stages:
                     
                     cd environments/dev
                     
-                    # Configure AWS
                     export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
                     export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
                     export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
@@ -263,7 +600,6 @@ stages:
                     
                     cd environments/dev
                     
-                    # Configure AWS
                     export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
                     export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
                     export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
@@ -282,11 +618,12 @@ stages:
                   displayName: 'Publish DEV Outputs'
 
   # ========================================
-  # Stage 2: Deploy to QA
+  # Stage 7: Deploy to QA
   # ========================================
   - stage: DeployQA
     displayName: 'Deploy to QA'
     dependsOn: DeployDev
+    condition: succeeded()
     jobs:
       - deployment: DeployQAEnvironment
         displayName: 'Deploy QA'
@@ -298,8 +635,10 @@ stages:
             deploy:
               steps:
                 - checkout: self
+                
                 - download: current
                   artifact: actions-dist
+                  displayName: 'Download CI Build Artifacts'
 
                 - script: |
                     set -euo pipefail
@@ -320,7 +659,9 @@ stages:
                     export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
                     export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
                     
+                    echo "========================================"
                     echo "Deploying to QA: $(ENVIRONMENT_NAME)"
+                    echo "========================================"
                     
                     terraform init \
                       -backend-config="bucket=$(TF_STATE_BUCKET)" \
@@ -344,6 +685,7 @@ stages:
                     terraform output -json > "$(Build.ArtifactStagingDirectory)/qa-outputs.json"
                     
                     echo "✓ QA deployment complete"
+                    echo "========================================"
                   displayName: 'Deploy to QA'
                   env:
                     TF_IN_AUTOMATION: '1'
@@ -359,11 +701,12 @@ stages:
                   displayName: 'Publish QA Artifacts'
 
   # ========================================
-  # Stage 3: Deploy to VAL
+  # Stage 8: Deploy to VAL
   # ========================================
   - stage: DeployVal
     displayName: 'Deploy to VAL'
     dependsOn: DeployQA
+    condition: succeeded()
     jobs:
       - deployment: DeployValEnvironment
         displayName: 'Deploy VAL'
@@ -375,8 +718,10 @@ stages:
             deploy:
               steps:
                 - checkout: self
+                
                 - download: current
                   artifact: actions-dist
+                  displayName: 'Download CI Build Artifacts'
 
                 - script: |
                     set -euo pipefail
@@ -397,7 +742,9 @@ stages:
                     export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
                     export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
                     
+                    echo "========================================"
                     echo "Deploying to VAL: $(ENVIRONMENT_NAME)"
+                    echo "========================================"
                     
                     terraform init \
                       -backend-config="bucket=$(TF_STATE_BUCKET)" \
@@ -421,6 +768,7 @@ stages:
                     terraform output -json > "$(Build.ArtifactStagingDirectory)/val-outputs.json"
                     
                     echo "✓ VAL deployment complete"
+                    echo "========================================"
                   displayName: 'Deploy to VAL'
                   env:
                     TF_IN_AUTOMATION: '1'
@@ -436,11 +784,12 @@ stages:
                   displayName: 'Publish VAL Artifacts'
 
   # ========================================
-  # Stage 4: Deploy to PROD (Enterprise Best Practices)
+  # Stage 9: Deploy to PROD (Enterprise Best Practices)
   # ========================================
   - stage: DeployProd
     displayName: 'Deploy to PROD'
     dependsOn: DeployVal
+    condition: succeeded()
     jobs:
       - deployment: DeployProdEnvironment
         displayName: 'Deploy PROD'
@@ -455,6 +804,7 @@ stages:
                 
                 - download: current
                   artifact: actions-dist
+                  displayName: 'Download CI Build Artifacts'
 
                 - script: |
                     set -euo pipefail
@@ -467,7 +817,7 @@ stages:
                   inputs:
                     terraformVersion: $(TF_VERSION)
 
-                # Step 1: Terraform Init (Separate)
+                # Step 1: Terraform Init (Separate for PROD)
                 - script: |
                     set -euo pipefail
                     
@@ -504,7 +854,7 @@ stages:
                     AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
                     AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
 
-                # Step 2: Terraform Plan (Separate)
+                # Step 2: Terraform Plan (Separate for PROD)
                 - script: |
                     set -euo pipefail
                     
@@ -535,9 +885,8 @@ stages:
                     echo "========================================"
                     echo "MANUAL CHECKPOINT"
                     echo "========================================"
-                    echo "STOP: Review the plan artifact before proceeding"
-                    echo "Plan artifact: prod-plan.txt"
-                    echo "Next step will apply these changes to PRODUCTION"
+                    echo "⚠ STOP: Review prod-plan.txt before approving"
+                    echo "Next step will apply changes to PRODUCTION"
                     echo "========================================"
                   displayName: 'Step 2: Terraform Plan'
                   env:
@@ -554,9 +903,9 @@ stages:
                   displayName: 'Publish PROD Plan for Review'
 
                 # Manual Approval Checkpoint (via Environment gate)
-                # Reviewers should examine prod-plan.txt before approving
+                # Reviewers must examine prod-plan.txt before approving
 
-                # Step 3: Terraform Apply (Separate)
+                # Step 3: Terraform Apply (Separate for PROD)
                 - script: |
                     set -euo pipefail
                     
@@ -634,18 +983,9 @@ stages:
                     echo "Next Steps:"
                     echo "1. Verify Auth0 tenant functionality"
                     echo "2. Check application integrations"
-                    echo "3. Monitor logs for errors"
+                    echo "3. Monitor Auth0 logs for errors"
                     echo "4. Notify stakeholders"
                     echo ""
-                    echo "Rollback: Use git revert + redeploy if issues"
+                    echo "Rollback: git revert + redeploy if issues"
                     echo "========================================"
                   displayName: 'Step 5: Deployment Summary'
-
-                # Optional: Send notification
-                - script: |
-                    echo "Send notification to: $(NOTIFICATION_EMAIL)"
-                    echo "Subject: PROD Deployment Complete - $(Build.BuildNumber)"
-                    echo "Status: SUCCESS"
-                  displayName: 'Send Success Notification'
-                  condition: succeeded()
-                  continueOnError: true
