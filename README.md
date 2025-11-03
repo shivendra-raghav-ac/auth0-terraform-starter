@@ -1,12 +1,12 @@
-# Auth0 Terraform + Azure DevOps: Setup Guide
+# Auth0 Terraform + Azure DevOps: Enterprise Setup Guide
 
-This guide streamlines setup of Auth0 infrastructure as code with Terraform, S3-native state locking, and Azure DevOps CI/CD.
+This guide streamlines setup of Auth0 infrastructure as code with Terraform, S3-native state locking, separated CI/CD pipelines, and Azure DevOps with enterprise best practices.
 
 ---
 
 ## Prerequisites
 
-* Terraform ≥ 1.11.0 (required for S3-native locking)
+* Terraform ≥ 1.13.3 (required for S3-native locking)
 * Node.js 20+
 * AWS CLI configured
 * Auth0 Management API credentials for each environment (dev, qa, val, prod)
@@ -15,22 +15,37 @@ This guide streamlines setup of Auth0 infrastructure as code with Terraform, S3-
 
 ---
 
-## Phase 1 — Local Setup (One-Time)
+## Architecture Overview
 
-### 1.1 S3 Backend
+**Pipeline Strategy:**
+- **CI Pipeline** (`azure-pipelines-ci.yml`): Validates PRs and branches - builds, tests, security scans
+- **CD Pipeline** (`azure-pipelines-cd.yml`): Deploys to all environments with progressive approvals
+- **GitHub Flow**: Feature branches → PR → master → auto-deploy
 
-* Create an S3 bucket for Terraform state (per organization). Enable **versioning** and **encryption**.
-* DynamoDB is not required. S3-native locking uses a `.tflock` object.
+**Environments:**
+- **DEV** (`na-dev-axon-cic`): Auto-deploy, rapid iteration
+- **QA** (`na-qa-axon-cic`): Optional approval, automated testing
+- **VAL** (`na-val-axon-cic`): Required approval, business validation
+- **PROD** (`na-prod-axon-cic`): Strict approvals, separated init/plan/apply steps
+
+---
+
+## Phase 1 — AWS S3 Backend Setup (One-Time)
+
+### 1.1 Create S3 Buckets
+
+Create **separate S3 buckets per environment**. Enable **versioning** and **encryption** for each.
 
 ### 1.2 Backend Configuration
 
-Edit the `bucket` per environment backend file and set `use_lockfile = true`.
+Update backend configuration in each environment directory:
 
+**`environments/dev/backend.tf`:**
 ```hcl
 terraform {
   backend "s3" {
-    bucket       = "auth0-terraform-state-1234567890"
-    key          = "auth0/dev/terraform.tfstate"
+    bucket       = "axon-tf-state-na-cic-{env}"
+    key          = "terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true
     use_lockfile = true
@@ -38,65 +53,160 @@ terraform {
 }
 ```
 
-Files to update:
+Repeat for **qa**, **val**, and **prod** with respective bucket names.
 
-* `environments/dev/backend.tf`
-* `environments/qa/backend.tf`
-* `environments/val/backend.tf`
-* `environments/prod/backend.tf`
+### 1.3 IAM Permissions
 
-### 1.3 Auth0 M2M Applications (per environment)
+Ensure AWS credentials have these permissions for their respective environment buckets:
+
+**Best Practice:** Use separate AWS IAM users or roles per environment for production isolation.
+
+---
+
+## Phase 2 — Auth0 Setup
+
+### 2.1 Auth0 M2M Applications (per environment)
+
+For each environment:
 
 * Auth0 Dashboard → Applications → Create Application → **Machine to Machine**
 * Authorize **Auth0 Management API**
 * Grant required scopes (at minimum):
-
   * clients, client_grants, connections: read/create/update/delete
   * branding: read/update
   * prompts: read/update
   * actions: read/create/update/delete
   * attack_protection: read/update
   * log_streams: read/create/update/delete
-* Record Domain, Client ID, Client Secret.
+* Record Domain, Client ID, Client Secret
 
-### 1.4 Environment Variable Files
+### 2.2 Tenant Naming Convention
 
-Create non-committed `*.tfvars` files per environment. Only commit `*.tfvars.example` or `*.tfvars` with configuration that does not include secrets.
+Based on pattern `na-dev-axon-cic`:
+
+| Environment | Tenant Domain |
+|-------------|--------------|
+| DEV | `na-dev-axon-cic.us.auth0.com` |
+| QA | `na-qa-axon-cic.us.auth0.com` |
+| VAL | `na-val-axon-cic.us.auth0.com` |
+| PROD | `na-axon-cic.us.auth0.com` |
+
+### 2.3 Environment Variable Files
+
+Create non-committed `*.tfvars.json` files per environment:
 
 ```bash
-cp environments/dev/dev.platform.tfvars.example environments/dev/dev.platform.tfvars
+cp environments/dev/dev.platform.tfvars.example environments/dev/dev.platform.tfvars.json
 ```
 
-Example `dev.platform.tfvars`:
-
-```hcl
-auth0_domain        = "dev-yourcompany.us.auth0.com"
-auth0_client_id     = "YOUR_CLIENT_ID"
-auth0_client_secret = "YOUR_CLIENT_SECRET"
-environment         = "dev"
+Example `dev.platform.tfvars.json`:
+```json
+{
+  "environment": "dev",
+  "app_callbacks": [
+    "https://dev-app.yourcompany.com/callback"
+  ]
+}
 ```
 
-Ensure `*.tfvars` are `.gitignore`d.
+Ensure `*.tfvars` and `*.tfvars.json` are `.gitignore`d.
 
 ---
 
-## Phase 2 — Local Validation (DEV First)
+## Phase 3 — Azure DevOps Configuration
 
-### 2.1 Verify Terraform Version
+### 3.1 Variable Groups
+
+Create in **Pipelines → Library**.
+
+**terraform-common-axon-cic** (Shared):
+```
+TF_VERSION = 1.13.3
+NODE_VERSION = 20.x
+```
+
+**na-dev-axon-cic**:
+```
+AUTH0_DOMAIN = na-dev-axon-cic.us.auth0.com
+AUTH0_CLIENT_ID = <dev_client_id>             # mark as secret
+AUTH0_CLIENT_SECRET = <dev_client_secret>     # mark as secret
+AWS_ACCESS_KEY_ID = <aws_access_key>          # mark as secret
+AWS_SECRET_ACCESS_KEY = <aws_secret_key>      # mark as secret
+AWS_DEFAULT_REGION = us-east-1
+TF_STATE_BUCKET = terraform-state-axon-cic-dev
+app_callbacks = https://dev-app.yourcompany.com/callback,https://dev-app.yourcompany.com/silent-callback
+ENVIRONMENT_NAME = na-dev-axon-cic
+```
+
+Repeat for **na-qa-axon-cic**, **na-val-axon-cic**, and **na-prod-axon-cic** with respective values.
+
+**Note:** AWS credentials are stored in variable groups (not service connections). Consider migrating to Azure Key Vault for enhanced security.
+
+### 3.2 Environments and Approvals
+
+Create Azure DevOps **Environments**:
+
+* `na-dev-axon-cic` - No approval (auto-deploy)
+* `na-qa-axon-cic` - Optional approval
+* `na-val-axon-cic` - Required: 1 technical lead approver
+* `na-prod-axon-cic` - **Required: 2 approvers (tech lead + ops), business hours enforcement**
+
+For `na-prod-axon-cic`, configure:
+- Approvals and checks → Add Approval
+- Minimum 2 approvers
+- Timeout: 7 days
+- Optional: Business hours restriction
+
+### 3.3 GitHub Branch Protection
+
+In GitHub: **Settings → Branches → Add rule** for `master`:
+
+```
+☑ Require a pull request before merging
+  ☑ Require approvals: 2
+  ☑ Dismiss stale pull request approvals when new commits are pushed
+
+☑ Require status checks to pass before merging
+  ☑ Require branches to be up to date before merging
+  Required: azure-pipelines-ci (Build, SecurityScan, Validate stages)
+
+☑ Require conversation resolution before merging
+
+☑ Do not allow bypassing the above settings
+
+☑ Restrict who can push to matching branches (DevOps team only)
+```
+
+### 3.4 Pipelines
+
+Create two pipelines:
+
+1. **CI Pipeline**: Pipelines → New → `azure-pipelines-ci.yml`
+2. **CD Pipeline**: Pipelines → New → `azure-pipelines-cd.yml`
+
+---
+
+## Phase 4 — Local Validation (DEV First)
+
+### 4.1 Verify Terraform Version
 
 ```bash
 terraform version
+# Should be >= 1.13.3
 ```
 
-### 2.2 Export Auth0 Credentials (DEV)
+### 4.2 Export Credentials (DEV)
 
 ```bash
-export AUTH0_DOMAIN="dev-yourcompany.us.auth0.com"
+export AUTH0_DOMAIN="na-dev-axon-cic.us.auth0.com"
 export AUTH0_CLIENT_ID="your_dev_client_id"
 export AUTH0_CLIENT_SECRET="your_dev_client_secret"
+export AWS_ACCESS_KEY_ID="your_dev_aws_key"
+export AWS_SECRET_ACCESS_KEY="your_dev_aws_secret"
+export AWS_DEFAULT_REGION="us-east-1"
 ```
 
-### 2.3 Build and Test Actions
+### 4.3 Build and Test Actions
 
 ```bash
 cd actions
@@ -105,26 +215,31 @@ npm run build
 npm test
 ```
 
-### 2.4 Initialize and Plan
+### 4.4 Initialize and Plan
 
 ```bash
 cd ../environments/dev
-terraform init
-terraform plan -var-file=dev.platform.tfvars
+terraform init \
+  -backend-config="bucket=terraform-state-axon-cic-dev" \
+  -backend-config="key=terraform.tfstate" \
+  -backend-config="region=us-east-1" \
+  -backend-config="use_lockfile=true" \
+  -backend-config="encrypt=true"
+
+terraform plan -var-file=dev.platform.tfvars.json
 ```
 
-Validate planned resources (tenant, branding, connections, actions, trigger bindings, attack protection, optional sample app).
+Validate planned resources (tenant, branding, connections, actions, trigger bindings, attack protection).
 
-### 2.5 Apply to DEV
+### 4.5 Apply to DEV
 
 ```bash
-terraform apply -var-file=dev.platform.tfvars
+terraform apply -var-file=dev.platform.tfvars.json
 ```
 
-* Lock file appears during apply: `auth0/dev/terraform.tfstate.tflock`
-* State: `auth0/dev/terraform.tfstate`
+Lock file appears during apply: `terraform.tfstate.tflock` in S3 bucket.
 
-### 2.6 Verify in Auth0
+### 4.6 Verify in Auth0
 
 * Branding: Universal Login reflects colors/logo
 * Connections: Passwordless email exists and enabled
@@ -134,103 +249,83 @@ terraform apply -var-file=dev.platform.tfvars
 
 ---
 
-## Phase 3 — Azure DevOps Setup
+## Phase 5 — CI/CD Pipeline Execution
 
-### 3.1 Variable Groups
-
-Create in **Pipelines → Library**.
-
-**auth0-terraform-common**
-
-```
-TF_STATE_BUCKET = auth0-terraform-state-1234567890
-TF_STATE_REGION = us-east-1
-```
-
-**auth0-dev**
-
-```
-AUTH0_DOMAIN = dev-yourcompany.us.auth0.com
-AUTH0_CLIENT_ID = <dev_client_id>
-AUTH0_CLIENT_SECRET = <dev_secret>    # mark as secret
-```
-
-Repeat for **auth0-qa**, **auth0-val**, **auth0-prod**.
-
-### 3.2 AWS Service Connection
-
-Project Settings → Service Connections → New → **AWS**
-
-* Name: `aws-terraform-backend`
-* Access Key, Secret Key, Region
-* Verify connection
-
-Required IAM permissions for the state bucket:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::auth0-terraform-state-*",
-        "arn:aws:s3:::auth0-terraform-state-*/*"
-      ]
-    }
-  ]
-}
-```
-
-### 3.3 Environments and Approvals
-
-Create Azure DevOps **Environments**:
-
-* `auth0-dev`, `auth0-qa` (no approval)
-* `auth0-val` (optional approval)
-* `auth0-prod` (approval required)
-
-For `auth0-prod`, add **Approvals and checks** with approvers, a timeout (e.g., 30 days), and a minimum approver count.
-
-### 3.4 Pipeline
-
-Create pipeline from repository `azure-pipelines.yml`. Save and review.
-
----
-
-## Phase 4 — First CI/CD Run
-
-### 4.1 Trigger
+### 5.1 Development Workflow
 
 ```bash
+# 1. Create feature branch
+git checkout -b feature/add-mfa-enforcement
+
+# 2. Make changes, test locally in DEV
+cd environments/dev
+terraform plan -var-file=dev.platform.tfvars.json
+terraform apply -var-file=dev.platform.tfvars.json
+
+# 3. Commit and push
 git add .
-git commit -m "Set up CI/CD with S3-native locking"
-git push origin main
+git commit -m "feat: add MFA enforcement action"
+git push origin feature/add-mfa-enforcement
+
+# 4. Create Pull Request
+# CI Pipeline runs automatically:
+#   ✓ Build Actions
+#   ✓ Run Tests  
+#   ✓ Security Scan (Checkov, TFSec)
+#   ✓ Validate Terraform (all environments)
+#   ✓ Generate plan preview
+
+# 5. Get 2 approvals, merge to master
+
+# 6. CD Pipeline triggers automatically
+#   ✓ Deploy DEV (automatic)
+#   ✓ Deploy QA (automatic or approval)
+#   ⏸ Deploy VAL (approval required)
+#   ⏸ Deploy PROD (2 approvals required)
 ```
 
-### 4.2 Expected Stages
+### 5.2 First Pipeline Run
 
-* Build & Test: build actions, run tests, coverage, validate Terraform for all envs
-* Deploy DEV: init (S3 backend), plan, apply, capture outputs
-* Deploy QA: automatic after DEV
-* Deploy VAL: automatic after QA
-* Deploy PROD: pauses for approval
+```bash
+git add azure-pipelines-ci.yml azure-pipelines-cd.yml
+git commit -m "ci: add separated CI/CD pipelines"
+git push origin master
+```
 
-### 4.3 Verify and Approve
+**CD Pipeline Stages:**
+1. BuildArtifacts: Compile TypeScript actions
+2. DeployDev: Automatic deployment
+3. DeployQA: Automatic (or wait for approval)
+4. DeployVal: Wait for 1 approval
+5. DeployProd: Wait for 2 approvals (separate init/plan/apply steps)
 
-* Verify DEV tenant while QA/VAL proceed
-* For PROD: review plans and previous environment results, then approve in `auth0-prod` environment
+### 5.3 Production Deployment Process
 
-### 4.4 Post-Deploy Verification (PROD)
+When PROD stage reaches approval gate:
 
-* Resources match lower envs
-* Login flow functions as intended
+1. Download `prod-plan.txt` artifact and review
+2. Verify DEV, QA, VAL deployments succeeded
+3. Confirm changes match expectations
+4. Approve with 2 reviewers
+5. Monitor apply step execution
+6. Verify PROD tenant functionality
+
+### 5.4 Post-Deployment Verification
+
+```bash
+# Download outputs from pipeline artifacts
+# OR run locally:
+cd environments/prod
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+terraform output -json
+```
+
+Verify in Auth0 Dashboard:
+- Login flow works
+- Actions execute correctly
+- No errors in logs
+- Applications authenticate successfully
 
 ---
 
@@ -240,10 +335,10 @@ git push origin main
 
 ```bash
 # Modify modules or actions
-# Validate in DEV locally
-terraform plan -var-file=dev.platform.tfvars
-terraform apply -var-file=dev.platform.tfvars
-# Commit to trigger CI/CD
+# Test in DEV locally
+terraform plan -var-file=dev.platform.tfvars.json
+terraform apply -var-file=dev.platform.tfvars.json
+# Create PR to trigger CI/CD
 ```
 
 ### Adding or Updating Actions
@@ -251,13 +346,34 @@ terraform apply -var-file=dev.platform.tfvars
 * Implement TypeScript action and tests in `actions/`
 * `npm test && npm run build`
 * Update Terraform modules and apply to DEV
-* Push to deploy through pipeline
+* Push and create PR to deploy through pipeline
 
 ### Rollbacks
 
-* Prefer `git revert` and push to redeploy
-* Emergency manual rollback (PROD): checkout last known good commit, apply with `prod.platform.tfvars`
-* Targeted rollback: `terraform taint` or `terraform destroy -target` for specific resources, then apply
+**Preferred Method (Revert and Redeploy):**
+```bash
+git revert <commit-hash>
+git push origin master
+# CD pipeline redeploys automatically
+```
+
+**Emergency Manual Rollback (PROD Only):**
+```bash
+git checkout <last-good-commit>
+cd environments/prod
+# Export credentials
+terraform init
+terraform apply -var-file=prod.platform.tfvars.json
+# Document in incident report
+```
+
+**Targeted Rollback:**
+```bash
+terraform taint module.problematic_action.auth0_action.this
+# OR
+terraform destroy -target=module.problematic_action.auth0_action.this
+terraform apply -var-file=prod.platform.tfvars.json
+```
 
 ---
 
@@ -280,88 +396,89 @@ npm run build
 
 ### State locked / cannot acquire lock
 
-* Confirm no concurrent runs
-* Inspect S3 prefix for `.tflock`
+Confirm no concurrent runs, then inspect S3 for `.tflock`:
 
 ```bash
-aws s3 ls s3://<BUCKET>/auth0/dev/
-# If certain it is stale:
-aws s3 rm s3://<BUCKET>/auth0/dev/terraform.tfstate.tflock
-```
+aws s3 ls s3://terraform-state-axon-cic-dev/terraform.tfstate.tflock
 
-* With versioning, check/delete markers if needed
+# If stale (confirmed no active runs):
+aws s3 rm s3://terraform-state-axon-cic-dev/terraform.tfstate.tflock
+```
 
 ### AWS credentials error in pipeline
 
-* Service connection `aws-terraform-backend` exists and verifies
-* S3 IAM policy present
-* Variable group `auth0-terraform-common` set with `TF_STATE_BUCKET`, `TF_STATE_REGION`
+* Verify variable group has `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` marked as secret
+* Test credentials locally:
+  ```bash
+  aws sts get-caller-identity
+  ```
+* Check IAM policy has required S3 permissions
+* Verify `TF_STATE_BUCKET` variable matches actual bucket name
 
 ### Versioning not enabled
 
 ```bash
 aws s3api put-bucket-versioning \
-  --bucket <BUCKET> \
+  --bucket terraform-state-axon-cic-prod \
   --versioning-configuration Status=Enabled
 ```
 
-### Terraform version too old
+### Terraform version mismatch
 
-Upgrade to ≥ 1.11.0 and re-run `terraform init`.
+Upgrade to ≥ 1.13.3 and re-run `terraform init`.
+
+### Pipeline not triggering
+
+**CI Pipeline not running on PR:**
+- Verify GitHub-Azure DevOps connection
+- Check trigger paths in YAML match changed files
+- Ensure branch protection requires CI status checks
+
+**CD Pipeline not running on merge:**
+- Verify `azure-pipelines-cd.yml` trigger includes `master` branch
+- Check pipeline is not disabled
+- Review path filters
 
 ### Action not enforcing verified email
 
 * Confirm action exists, is deployed, and bound to Login flow
-* Inspect state as needed:
-
-```bash
-terraform state show module.verified_email_action.auth0_action.post_login
-terraform state show module.verified_email_action.auth0_trigger_actions.login
-```
+* Inspect state:
+  ```bash
+  terraform state show module.verified_email_action.auth0_action.post_login
+  terraform state show module.verified_email_action.auth0_trigger_actions.login
+  ```
+* Check Auth0 logs for action execution errors
 
 ---
 
 ## Security Checklist
 
-* `*.tfvars` with secrets excluded via `.gitignore`
-* Secrets in Azure DevOps variable groups (marked secret)
-* S3 bucket: encryption enabled, versioning enabled, public access blocked
-* Manual approval gate for PROD
-* Least-privilege IAM for S3 state
-* No hardcoded secrets in code
-* Auth0 M2M apps only
-* Terraform state encrypted at rest; access logged via CloudTrail
-
----
-
-## Monitoring and Observability
-
-* `terraform output` (or pipeline artifacts) for outputs; `-json` for machine use
-* Auth0 Dashboard → Monitoring → Logs for login failures and action errors
-* Optional Log Streams to SIEM (configure via Terraform module)
-* Azure DevOps Pipelines → Runs for success rate, durations, failures; configure alerts as needed
+* `*.tfvars` and `*.tfvars.json` with secrets excluded via `.gitignore`
+* All secrets marked as secret in Azure DevOps variable groups
+* S3 buckets: encryption enabled, versioning enabled, public access blocked
+* Separate S3 buckets per environment
+* Manual approval gates for VAL and PROD (2 approvers for PROD)
+* Least-privilege IAM for S3 state (preferably separate AWS accounts per environment)
+* No hardcoded secrets in code or committed to repository
+* GitHub branch protection with required reviews and status checks
+* Separated CI/CD pipelines (separation of concerns)
 
 ---
 
 ## Performance Tips
 
-* Faster local testing: `terraform init -backend=false` or local backend with `-reconfigure`
-* Pipeline caching for npm packages
-* Path filters and parallel validation where applicable
+* **Pipeline caching**: npm packages cached automatically in CI pipeline
+* **Local testing**: Use `terraform init -backend=false` for faster iteration
+* **Path filters**: Only relevant paths trigger pipelines (actions/**, modules/**, environments/**)
+* **Parallel validation**: CI pipeline validates all environments in parallel
 
 ---
 
 ## Next Steps
 
-* Monitor production after first deployment
-* Configure log streams
-* Enforce MFA for Auth0 tenant admins
-* Add Auth0 metrics monitoring
-* Document runbooks for common tasks
-* Add/iterate actions (e.g., MFA enforcement)
-* Periodically review security settings
+* Set up drift detection (scheduled pipeline)
+* Document runbooks for common operational tasks
 * Prepare incident response plan
-* Train team on Terraform/Auth0 workflows
 
 ---
 
@@ -375,6 +492,5 @@ terraform state show module.verified_email_action.auth0_trigger_actions.login
 
 ## Support
 
-* Review pipeline logs and Terraform state
-* Check Auth0 logs for errors
-* Auth0 Support and AWS Support per vendor processes
+* Check Terraform state for resource drift
+* Internal DevOps team for pipeline and infrastructure questions

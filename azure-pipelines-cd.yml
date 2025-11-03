@@ -1,0 +1,651 @@
+# ========================================
+# CD Pipeline: Deploy to All Environments
+# Runs on: master branch only
+# Purpose: Progressive deployment with approvals
+# ========================================
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-cd
+
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - actions/**
+      - modules/**
+      - environments/**
+      - azure-pipelines-cd.yml
+
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: terraform-common-axon-cic
+  - name: NODE_VERSION
+    value: '20.x'
+  - name: TF_VERSION
+    value: '1.13.3'
+
+stages:
+  # ========================================
+  # Stage 0: Build Artifacts
+  # ========================================
+  - stage: BuildArtifacts
+    displayName: 'Build Deployment Artifacts'
+    jobs:
+      - job: Build
+        displayName: 'Build Actions for Deployment'
+        steps:
+          - task: NodeTool@0
+            displayName: 'Install Node.js'
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - script: |
+              set -euo pipefail
+              cd actions
+              npm ci
+              npm run build
+            displayName: 'Build Actions'
+
+          - publish: actions/dist
+            artifact: actions-dist
+            displayName: 'Publish Actions Artifact'
+
+  # ========================================
+  # Stage 1: Deploy to DEV
+  # ========================================
+  - stage: DeployDev
+    displayName: 'Deploy to DEV'
+    dependsOn: BuildArtifacts
+    jobs:
+      - deployment: DeployDevEnvironment
+        displayName: 'Deploy DEV'
+        environment: 'na-dev-axon-cic'
+        variables:
+          - group: na-dev-axon-cic
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - download: current
+                  artifact: actions-dist
+
+                - script: |
+                    set -euo pipefail
+                    mkdir -p actions/dist
+                    cp -r "$(Pipeline.Workspace)/actions-dist/"* actions/dist/
+                  displayName: 'Restore Actions Build'
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform $(TF_VERSION)'
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - script: |
+                    set -euo pipefail
+                    
+                    # Configure AWS credentials
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "========================================"
+                    echo "AWS Preflight Checks"
+                    echo "========================================"
+                    
+                    echo "Verifying AWS credentials..."
+                    CALLER_IDENTITY=$(aws sts get-caller-identity)
+                    echo "Authenticated as: $(echo $CALLER_IDENTITY | jq -r .Arn)"
+                    
+                    BUCKET="$(TF_STATE_BUCKET)"
+                    echo ""
+                    echo "Checking S3 bucket: $BUCKET"
+                    
+                    # Check versioning
+                    VERSION_STATUS=$(aws s3api get-bucket-versioning \
+                      --bucket "$BUCKET" \
+                      --query 'Status' \
+                      --output text 2>/dev/null || echo "None")
+                    
+                    if [ "$VERSION_STATUS" != "Enabled" ]; then
+                      echo "❌ ERROR: Bucket versioning is not enabled"
+                      echo "Enable with: aws s3api put-bucket-versioning --bucket $BUCKET --versioning-configuration Status=Enabled"
+                      exit 1
+                    fi
+                    echo "✓ Versioning: $VERSION_STATUS"
+                    
+                    # Check encryption
+                    SSE_ALGO=$(aws s3api get-bucket-encryption \
+                      --bucket "$BUCKET" \
+                      --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+                      --output text 2>/dev/null || echo "None")
+                    
+                    if [ "$SSE_ALGO" = "None" ] || [ -z "$SSE_ALGO" ]; then
+                      echo "❌ ERROR: Bucket encryption is not enabled"
+                      exit 1
+                    fi
+                    echo "✓ Encryption: $SSE_ALGO"
+                    
+                    echo ""
+                    echo "✓ All preflight checks passed"
+                    echo "========================================"
+                  displayName: 'Preflight: Verify AWS & S3'
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/dev
+                    
+                    # Configure AWS
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "========================================"
+                    echo "Terraform Init - DEV"
+                    echo "========================================"
+                    echo "Environment: $(ENVIRONMENT_NAME)"
+                    echo "State Bucket: $(TF_STATE_BUCKET)"
+                    echo "State Key: terraform.tfstate"
+                    echo "Locking: S3-native (use_lockfile=true)"
+                    echo "========================================"
+                    
+                    terraform init \
+                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
+                      -backend-config="key=terraform.tfstate" \
+                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
+                      -backend-config="use_lockfile=true" \
+                      -backend-config="encrypt=true" \
+                      -input=false -no-color
+                    
+                    echo "✓ Terraform initialized successfully"
+                  displayName: 'Terraform Init'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/dev
+                    
+                    # Configure AWS
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "========================================"
+                    echo "Terraform Plan - DEV"
+                    echo "========================================"
+                    
+                    terraform plan \
+                      -input=false \
+                      -no-color \
+                      -lock-timeout=5m \
+                      -var-file=dev.platform.tfvars.json \
+                      -var="app_callbacks=$(app_callbacks)" \
+                      -out=tfplan
+                    
+                    echo ""
+                    echo "Converting plan to JSON..."
+                    terraform show -json tfplan > "$(Build.ArtifactStagingDirectory)/dev-plan.json"
+                    
+                    echo "Converting plan to readable format..."
+                    terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/dev-plan.txt"
+                    
+                    echo ""
+                    echo "✓ Plan generated successfully"
+                  displayName: 'Terraform Plan'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - publish: $(Build.ArtifactStagingDirectory)
+                  artifact: dev-plan
+                  displayName: 'Publish DEV Plan'
+
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/dev
+                    
+                    # Configure AWS
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "========================================"
+                    echo "Terraform Apply - DEV"
+                    echo "========================================"
+                    
+                    terraform apply \
+                      -input=false \
+                      -no-color \
+                      -lock-timeout=5m \
+                      -auto-approve \
+                      tfplan
+                    
+                    echo ""
+                    echo "✓ DEV deployment complete"
+                    echo "========================================"
+                  displayName: 'Terraform Apply'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/dev
+                    
+                    # Configure AWS
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    terraform output -json > "$(Build.ArtifactStagingDirectory)/dev-outputs.json"
+                    terraform output -no-color > "$(Build.ArtifactStagingDirectory)/dev-outputs.txt"
+                  displayName: 'Capture Terraform Outputs'
+                  continueOnError: true
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - publish: $(Build.ArtifactStagingDirectory)
+                  artifact: dev-outputs
+                  displayName: 'Publish DEV Outputs'
+
+  # ========================================
+  # Stage 2: Deploy to QA
+  # ========================================
+  - stage: DeployQA
+    displayName: 'Deploy to QA'
+    dependsOn: DeployDev
+    jobs:
+      - deployment: DeployQAEnvironment
+        displayName: 'Deploy QA'
+        environment: 'na-qa-axon-cic'
+        variables:
+          - group: na-qa-axon-cic
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: actions-dist
+
+                - script: |
+                    set -euo pipefail
+                    mkdir -p actions/dist
+                    cp -r "$(Pipeline.Workspace)/actions-dist/"* actions/dist/
+                  displayName: 'Restore Actions Build'
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - script: |
+                    set -euo pipefail
+                    cd environments/qa
+                    
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "Deploying to QA: $(ENVIRONMENT_NAME)"
+                    
+                    terraform init \
+                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
+                      -backend-config="key=terraform.tfstate" \
+                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
+                      -backend-config="use_lockfile=true" \
+                      -backend-config="encrypt=true" \
+                      -input=false -no-color
+                    
+                    terraform plan \
+                      -input=false -no-color -lock-timeout=5m \
+                      -var-file=qa.platform.tfvars.json \
+                      -var="app_callbacks=$(app_callbacks)" \
+                      -out=tfplan
+                    
+                    terraform show -json tfplan > "$(Build.ArtifactStagingDirectory)/qa-plan.json"
+                    terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/qa-plan.txt"
+                    
+                    terraform apply -input=false -no-color -lock-timeout=5m -auto-approve tfplan
+                    
+                    terraform output -json > "$(Build.ArtifactStagingDirectory)/qa-outputs.json"
+                    
+                    echo "✓ QA deployment complete"
+                  displayName: 'Deploy to QA'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - publish: $(Build.ArtifactStagingDirectory)
+                  artifact: qa-artifacts
+                  displayName: 'Publish QA Artifacts'
+
+  # ========================================
+  # Stage 3: Deploy to VAL
+  # ========================================
+  - stage: DeployVal
+    displayName: 'Deploy to VAL'
+    dependsOn: DeployQA
+    jobs:
+      - deployment: DeployValEnvironment
+        displayName: 'Deploy VAL'
+        environment: 'na-val-axon-cic'
+        variables:
+          - group: na-val-axon-cic
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: actions-dist
+
+                - script: |
+                    set -euo pipefail
+                    mkdir -p actions/dist
+                    cp -r "$(Pipeline.Workspace)/actions-dist/"* actions/dist/
+                  displayName: 'Restore Actions Build'
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - script: |
+                    set -euo pipefail
+                    cd environments/val
+                    
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "Deploying to VAL: $(ENVIRONMENT_NAME)"
+                    
+                    terraform init \
+                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
+                      -backend-config="key=terraform.tfstate" \
+                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
+                      -backend-config="use_lockfile=true" \
+                      -backend-config="encrypt=true" \
+                      -input=false -no-color
+                    
+                    terraform plan \
+                      -input=false -no-color -lock-timeout=5m \
+                      -var-file=val.platform.tfvars.json \
+                      -var="app_callbacks=$(app_callbacks)" \
+                      -out=tfplan
+                    
+                    terraform show -json tfplan > "$(Build.ArtifactStagingDirectory)/val-plan.json"
+                    terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/val-plan.txt"
+                    
+                    terraform apply -input=false -no-color -lock-timeout=5m -auto-approve tfplan
+                    
+                    terraform output -json > "$(Build.ArtifactStagingDirectory)/val-outputs.json"
+                    
+                    echo "✓ VAL deployment complete"
+                  displayName: 'Deploy to VAL'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - publish: $(Build.ArtifactStagingDirectory)
+                  artifact: val-artifacts
+                  displayName: 'Publish VAL Artifacts'
+
+  # ========================================
+  # Stage 4: Deploy to PROD (Enterprise Best Practices)
+  # ========================================
+  - stage: DeployProd
+    displayName: 'Deploy to PROD'
+    dependsOn: DeployVal
+    jobs:
+      - deployment: DeployProdEnvironment
+        displayName: 'Deploy PROD'
+        environment: 'na-prod-axon-cic'
+        variables:
+          - group: na-prod-axon-cic
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                
+                - download: current
+                  artifact: actions-dist
+
+                - script: |
+                    set -euo pipefail
+                    mkdir -p actions/dist
+                    cp -r "$(Pipeline.Workspace)/actions-dist/"* actions/dist/
+                  displayName: 'Restore Actions Build'
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                # Step 1: Terraform Init (Separate)
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/prod
+                    
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "========================================"
+                    echo "PRODUCTION DEPLOYMENT - INIT"
+                    echo "========================================"
+                    echo "Environment: $(ENVIRONMENT_NAME)"
+                    echo "Deployment ID: $(Build.BuildNumber)"
+                    echo "Triggered by: $(Build.RequestedFor)"
+                    echo "========================================"
+                    
+                    terraform init \
+                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
+                      -backend-config="key=terraform.tfstate" \
+                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
+                      -backend-config="use_lockfile=true" \
+                      -backend-config="encrypt=true" \
+                      -input=false -no-color
+                    
+                    echo "✓ PROD initialized"
+                  displayName: 'Step 1: Terraform Init'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                # Step 2: Terraform Plan (Separate)
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/prod
+                    
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "========================================"
+                    echo "PRODUCTION DEPLOYMENT - PLAN"
+                    echo "========================================"
+                    
+                    terraform plan \
+                      -input=false \
+                      -no-color \
+                      -lock-timeout=5m \
+                      -var-file=prod.platform.tfvars.json \
+                      -var="app_callbacks=$(app_callbacks)" \
+                      -out=tfplan
+                    
+                    echo ""
+                    echo "Exporting plan for review..."
+                    terraform show -json tfplan > "$(Build.ArtifactStagingDirectory)/prod-plan.json"
+                    terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/prod-plan.txt"
+                    
+                    echo ""
+                    echo "========================================"
+                    echo "MANUAL CHECKPOINT"
+                    echo "========================================"
+                    echo "STOP: Review the plan artifact before proceeding"
+                    echo "Plan artifact: prod-plan.txt"
+                    echo "Next step will apply these changes to PRODUCTION"
+                    echo "========================================"
+                  displayName: 'Step 2: Terraform Plan'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - publish: $(Build.ArtifactStagingDirectory)
+                  artifact: prod-plan
+                  displayName: 'Publish PROD Plan for Review'
+
+                # Manual Approval Checkpoint (via Environment gate)
+                # Reviewers should examine prod-plan.txt before approving
+
+                # Step 3: Terraform Apply (Separate)
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/prod
+                    
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    echo "========================================"
+                    echo "PRODUCTION DEPLOYMENT - APPLY"
+                    echo "========================================"
+                    echo "Applying approved changes to PRODUCTION..."
+                    echo ""
+                    
+                    terraform apply \
+                      -input=false \
+                      -no-color \
+                      -lock-timeout=5m \
+                      -auto-approve \
+                      tfplan
+                    
+                    echo ""
+                    echo "========================================"
+                    echo "✓ PRODUCTION DEPLOYMENT COMPLETE"
+                    echo "========================================"
+                  displayName: 'Step 3: Terraform Apply'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                # Step 4: Capture Outputs
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/prod
+                    
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    terraform output -json > "$(Build.ArtifactStagingDirectory)/prod-outputs.json"
+                    terraform output -no-color > "$(Build.ArtifactStagingDirectory)/prod-outputs.txt"
+                  displayName: 'Step 4: Capture Outputs'
+                  continueOnError: true
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+                - publish: $(Build.ArtifactStagingDirectory)
+                  artifact: prod-outputs
+                  displayName: 'Publish PROD Outputs'
+
+                # Step 5: Post-Deployment Summary
+                - script: |
+                    set -euo pipefail
+                    
+                    echo "========================================"
+                    echo "PRODUCTION DEPLOYMENT SUMMARY"
+                    echo "========================================"
+                    echo "Environment: $(ENVIRONMENT_NAME)"
+                    echo "Deployment ID: $(Build.BuildNumber)"
+                    echo "Completed: $(date -u)"
+                    echo "Deployed by: $(Build.RequestedFor)"
+                    echo "Terraform Version: $(TF_VERSION)"
+                    echo "State Bucket: $(TF_STATE_BUCKET)"
+                    echo "========================================"
+                    echo ""
+                    echo "Next Steps:"
+                    echo "1. Verify Auth0 tenant functionality"
+                    echo "2. Check application integrations"
+                    echo "3. Monitor logs for errors"
+                    echo "4. Notify stakeholders"
+                    echo ""
+                    echo "Rollback: Use git revert + redeploy if issues"
+                    echo "========================================"
+                  displayName: 'Step 5: Deployment Summary'
+
+                # Optional: Send notification
+                - script: |
+                    echo "Send notification to: $(NOTIFICATION_EMAIL)"
+                    echo "Subject: PROD Deployment Complete - $(Build.BuildNumber)"
+                    echo "Status: SUCCESS"
+                  displayName: 'Send Success Notification'
+                  condition: succeeded()
+                  continueOnError: true
