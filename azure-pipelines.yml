@@ -406,8 +406,9 @@ stages:
       - CISummary
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
     jobs:
-      - deployment: DeployDevEnvironment
-        displayName: 'Deploy DEV'
+      # Plan DEV Changes
+      - deployment: PlanDevEnvironment
+        displayName: 'Plan DEV Changes'
         environment: 'na-dev-axon-cic'
         variables:
           - group: na-dev-axon-cic
@@ -511,7 +512,7 @@ stages:
                       -input=false -no-color
                     
                     echo "✓ Terraform initialized"
-                  displayName: 'Terraform Init'
+                  displayName: 'Step 1: Terraform Init'
                   env:
                     TF_IN_AUTOMATION: '1'
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
@@ -543,12 +544,19 @@ stages:
                       -out=tfplan
                     
                     echo ""
-                    echo "Exporting plan..."
+                    echo "Exporting plan for review..."
                     terraform show -json tfplan > "$(Build.ArtifactStagingDirectory)/dev-plan.json"
                     terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/dev-plan.txt"
                     
-                    echo "✓ Plan generated"
-                  displayName: 'Terraform Plan'
+                    echo ""
+                    echo "========================================"
+                    echo "⚠ PLAN READY FOR REVIEW"
+                    echo "========================================"
+                    echo "Review dev-plan.txt artifact before approving"
+                    echo "========================================"
+                    
+                    echo "✓ Plan generated and ready for review"
+                  displayName: 'Step 2: Terraform Plan'
                   env:
                     TF_IN_AUTOMATION: '1'
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
@@ -560,7 +568,107 @@ stages:
 
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: dev-plan
-                  displayName: 'Publish DEV Plan'
+                  displayName: 'Publish DEV Plan for Review'
+
+                # Store the plan file for the apply job
+                - script: |
+                    set -euo pipefail
+                    cd environments/dev
+                    mkdir -p "$(Build.ArtifactStagingDirectory)/plan-file"
+                    cp tfplan "$(Build.ArtifactStagingDirectory)/plan-file/tfplan"
+                  displayName: 'Prepare Plan File for Apply'
+
+                - publish: $(Build.ArtifactStagingDirectory)/plan-file
+                  artifact: dev-plan-file
+                  displayName: 'Publish Plan File'
+
+      # Manual Approval Gate
+      - job: ApproveDev
+        displayName: 'Approve DEV Deployment'
+        dependsOn: PlanDevEnvironment
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            displayName: 'Review DEV Plan & Approve'
+            inputs:
+              notifyUsers: |
+                # Add your team email addresses here
+                team@example.com
+              instructions: |
+                ⚠️ **DEV DEPLOYMENT APPROVAL REQUIRED**
+                
+                Please review the plan before approving:
+                1. Download the 'dev-plan' artifact
+                2. Review dev-plan.txt for planned changes
+                3. Verify changes are expected and safe
+                4. Click 'Resume' to proceed with deployment
+                
+                Artifacts: $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)&view=artifacts
+              onTimeout: 'reject'
+
+      # Apply DEV Changes (after approval)
+      - deployment: ApplyDevEnvironment
+        displayName: 'Apply DEV Changes'
+        dependsOn: ApproveDev
+        environment: 'na-dev-axon-cic'
+        variables:
+          - group: na-dev-axon-cic
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - download: current
+                  artifact: actions-dist
+                  displayName: 'Download CI Build Artifacts'
+
+                - download: current
+                  artifact: dev-plan-file
+                  displayName: 'Download DEV Plan File'
+
+                - script: |
+                    set -euo pipefail
+                    mkdir -p actions/dist
+                    cp -r "$(Pipeline.Workspace)/actions-dist/"* actions/dist/
+                  displayName: 'Restore Actions Build'
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform $(TF_VERSION)'
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - script: |
+                    set -euo pipefail
+                    
+                    cd environments/dev
+                    
+                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
+                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
+                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    
+                    # Re-initialize Terraform
+                    terraform init \
+                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
+                      -backend-config="key=terraform.tfstate" \
+                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
+                      -backend-config="use_lockfile=true" \
+                      -backend-config="encrypt=true" \
+                      -input=false -no-color
+                    
+                    # Copy the approved plan file
+                    cp "$(Pipeline.Workspace)/dev-plan-file/tfplan" .
+                    
+                    echo "✓ Plan file restored and ready for apply"
+                  displayName: 'Restore Approved Plan'
+                  env:
+                    TF_IN_AUTOMATION: '1'
+                    AUTH0_DOMAIN: $(AUTH0_DOMAIN)
+                    AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
+                    AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
 
                 - script: |
                     set -euo pipefail
@@ -574,6 +682,7 @@ stages:
                     echo "========================================"
                     echo "Terraform Apply - DEV"
                     echo "========================================"
+                    echo "Applying approved plan to DEV..."
                     
                     terraform apply \
                       -input=false \
@@ -585,7 +694,7 @@ stages:
                     echo ""
                     echo "✓ DEV deployment complete"
                     echo "========================================"
-                  displayName: 'Terraform Apply'
+                  displayName: 'Step 3: Terraform Apply'
                   env:
                     TF_IN_AUTOMATION: '1'
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
@@ -616,7 +725,6 @@ stages:
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: dev-outputs
                   displayName: 'Publish DEV Outputs'
-
   # ========================================
   # Stage 7: Deploy to QA
   # ========================================
