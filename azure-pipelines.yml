@@ -28,7 +28,7 @@ pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  - group: terraform-common-axon-cic
+  - group: terraform-common-cic
   - name: NODE_VERSION
     value: '20.x'
   - name: TF_VERSION
@@ -246,7 +246,7 @@ stages:
       - job: PreviewDev
         displayName: 'Preview DEV Changes'
         variables:
-          - group: na-dev-axon-cic
+          - group: na-dev-cic
         steps:
           - download: current
             artifact: actions-dist
@@ -265,42 +265,45 @@ stages:
           - script: |
               set -euo pipefail
               
-              export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-              export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-              export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+              export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+              export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+              export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
               
-              echo "Verifying AWS credentials..."
-              aws sts get-caller-identity
+              echo "Verifying Azure credentials..."
+              az account show
               
-              echo "Checking S3 bucket: $(TF_STATE_BUCKET)"
-              aws s3api head-bucket --bucket "$(TF_STATE_BUCKET)" 2>/dev/null || {
-                echo "⚠ WARNING: S3 bucket may not exist or is inaccessible"
+              echo "Checking Storage Account: $(ARM_STORAGE_ACCOUNT)"
+              az storage account show --name "$(ARM_STORAGE_ACCOUNT)" --resource-group "$(ARM_RESOURCE_GROUP)" 2>/dev/null || {
+                echo "⚠ WARNING: Storage account may not exist or is inaccessible"
               }
-            displayName: 'Verify AWS Access'
+              
+              echo "Checking tfstate container..."
+              az storage container exists --account-name "$(ARM_STORAGE_ACCOUNT)" --name "$(ARM_CONTAINER_NAME)" 2>/dev/null || {
+                echo "⚠ WARNING: tfstate container may not exist"
+              }
+            displayName: 'Verify Azure Access'
             env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
           - script: |
               set -euo pipefail
               
               cd environments/dev
               
-              export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-              export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-              export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+              export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+              export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+              export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
               
               echo "========================================"
               echo "Plan Preview - DEV"
               echo "========================================"
               
               terraform init \
-                -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                -backend-config="key=terraform.tfstate" \
-                -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                -backend-config="use_lockfile=true" \
-                -backend-config="encrypt=true" \
+                -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                 -input=false -no-color
               
               echo ""
@@ -326,9 +329,9 @@ stages:
               AUTH0_DOMAIN: $(AUTH0_DOMAIN)
               AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
               AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
           - publish: $(Build.ArtifactStagingDirectory)
             artifact: plan-preview-dev
@@ -408,9 +411,9 @@ stages:
       # Plan DEV Changes
       - deployment: PlanDevEnvironment
         displayName: 'Plan DEV Changes'
-        environment: 'na-dev-axon-cic'
+        environment: 'na-dev-cic'
         variables:
-          - group: na-dev-axon-cic
+          - group: na-dev-cic
         strategy:
           runOnce:
             deploy:
@@ -436,78 +439,71 @@ stages:
                 - script: |
                     set -euo pipefail
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
-                    echo "AWS Preflight Checks - DEV"
+                    echo "Azure Preflight Checks - DEV"
                     echo "========================================"
                     
-                    echo "Verifying AWS credentials..."
-                    CALLER_IDENTITY=$(aws sts get-caller-identity)
-                    echo "Authenticated as: $(echo $CALLER_IDENTITY | jq -r .Arn)"
+                    echo "Verifying Azure credentials..."
+                    ACCOUNT=$(az account show)
+                    echo "Authenticated as: $(echo $ACCOUNT | jq -r .user.name)"
                     
-                    BUCKET="$(TF_STATE_BUCKET)"
+                    ACCOUNT_NAME="$(ARM_STORAGE_ACCOUNT)"
+                    RG_NAME="$(ARM_RESOURCE_GROUP)"
                     echo ""
-                    echo "Checking S3 bucket: $BUCKET"
+                    echo "Checking Storage Account: $ACCOUNT_NAME in RG: $RG_NAME"
                     
-                    VERSION_STATUS=$(aws s3api get-bucket-versioning \
-                      --bucket "$BUCKET" \
-                      --query 'Status' \
-                      --output text 2>/dev/null || echo "None")
-                    
-                    if [ "$VERSION_STATUS" != "Enabled" ]; then
-                      echo "❌ ERROR: Bucket versioning is not enabled"
-                      echo "Enable with: aws s3api put-bucket-versioning --bucket $BUCKET --versioning-configuration Status=Enabled"
+                    STORAGE=$(az storage account show --name "$ACCOUNT_NAME" --resource-group "$RG_NAME" 2>/dev/null)
+                    if [ $? -ne 0 ]; then
+                      echo "❌ ERROR: Storage account not found"
                       exit 1
                     fi
-                    echo "✓ Versioning: $VERSION_STATUS"
+                    echo "✓ Storage account found"
                     
-                    SSE_ALGO=$(aws s3api get-bucket-encryption \
-                      --bucket "$BUCKET" \
-                      --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
-                      --output text 2>/dev/null || echo "None")
+                    CONTAINER_NAME="$(ARM_CONTAINER_NAME)"
+                    echo ""
+                    echo "Checking Blob Container versioning: $CONTAINER_NAME"
                     
-                    if [ "$SSE_ALGO" = "None" ] || [ -z "$SSE_ALGO" ]; then
-                      echo "❌ ERROR: Bucket encryption is not enabled"
+                    PROPS=$(az storage container show --account-name "$ACCOUNT_NAME" --name "$CONTAINER_NAME" 2>/dev/null)
+                    if [ $? -ne 0 ]; then
+                      echo "❌ ERROR: Container not found"
                       exit 1
                     fi
-                    echo "✓ Encryption: $SSE_ALGO"
+                    echo "✓ Container found"
                     
                     echo ""
                     echo "✓ All preflight checks passed"
                     echo "========================================"
-                  displayName: 'Preflight: Verify AWS & S3'
+                  displayName: 'Preflight: Verify Azure Storage'
                   env:
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/dev
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "Terraform Init - DEV"
                     echo "========================================"
                     echo "Environment: $(ENVIRONMENT_NAME)"
-                    echo "State Bucket: $(TF_STATE_BUCKET)"
-                    echo "State Key: terraform.tfstate"
-                    echo "Locking: S3-native (use_lockfile=true)"
+                    echo "Storage Account: $(ARM_STORAGE_ACCOUNT)"
+                    echo "Container: $(ARM_CONTAINER_NAME)"
                     echo "========================================"
                     
                     terraform init \
-                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                      -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                     
                     echo "✓ Terraform initialized"
@@ -517,18 +513,18 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/dev
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "Terraform Plan - DEV"
@@ -560,9 +556,9 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: dev-plan
@@ -608,9 +604,9 @@ stages:
       - deployment: ApplyDevEnvironment
         displayName: 'Apply DEV Changes'
         dependsOn: ApproveDev
-        environment: 'na-dev-axon-cic'
+        environment: 'na-dev-cic'
         variables:
-          - group: na-dev-axon-cic
+          - group: na-dev-cic
         strategy:
           runOnce:
             deploy:
@@ -641,17 +637,15 @@ stages:
                     
                     cd environments/dev
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     # Re-initialize Terraform
                     terraform init \
-                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                      -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                     
                     # Copy the approved plan file
@@ -664,18 +658,18 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/dev
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "Terraform Apply - DEV"
@@ -698,27 +692,27 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/dev
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     terraform output -json > "$(Build.ArtifactStagingDirectory)/dev-outputs.json"
                     terraform output -no-color > "$(Build.ArtifactStagingDirectory)/dev-outputs.txt"
                   displayName: 'Capture Terraform Outputs'
                   continueOnError: true
                   env:
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: dev-outputs
@@ -734,9 +728,9 @@ stages:
       # Job 1: Plan
       - deployment: PlanQAEnvironment
         displayName: 'Plan QA Changes'
-        environment: 'na-qa-axon-cic'
+        environment: 'na-qa-cic'
         variables:
-          - group: na-qa-axon-cic
+          - group: na-qa-cic
         strategy:
           runOnce:
             deploy:
@@ -753,14 +747,12 @@ stages:
                     terraformVersion: $(TF_VERSION)
                 - script: | # Terraform init
                     cd environments/qa
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
-                    terraform init -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
+                    terraform init -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                   displayName: 'Terraform Init'
                   env:
@@ -768,16 +760,17 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
                 - script: | # Terraform plan
                     cd environments/qa
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     terraform plan -input=false -no-color -lock-timeout=5m \
                       -var-file=qa.platform.tfvars.json \
+                      -out=tfplan
                     terraform show -json tfplan > "$(Build.ArtifactStagingDirectory)/qa-plan.json"
                     terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/qa-plan.txt"
                   displayName: 'Terraform Plan'
@@ -786,9 +779,9 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: qa-plan
                 - script: |
@@ -824,9 +817,9 @@ stages:
       - deployment: ApplyQAEnvironment
         displayName: 'Apply QA Changes'
         dependsOn: ApproveQA
-        environment: 'na-qa-axon-cic'
+        environment: 'na-qa-cic'
         variables:
-          - group: na-qa-axon-cic
+          - group: na-qa-cic
         strategy:
           runOnce:
             deploy:
@@ -845,14 +838,12 @@ stages:
                     terraformVersion: $(TF_VERSION)
                 - script: | # Re-init and restore plan
                     cd environments/qa
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
-                    terraform init -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
+                    terraform init -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                     cp "$(Pipeline.Workspace)/qa-plan-file/tfplan" .
                   displayName: 'Restore Approved Plan'
@@ -861,14 +852,14 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
                 - script: | # Apply
                     cd environments/qa
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     terraform apply -input=false -no-color \
                       -lock-timeout=5m -auto-approve tfplan
                   displayName: 'Terraform Apply'
@@ -877,22 +868,22 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
                 - script: |
                     cd environments/qa
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     terraform output -json > "$(Build.ArtifactStagingDirectory)/qa-outputs.json"
                     terraform output -no-color > "$(Build.ArtifactStagingDirectory)/qa-outputs.txt"
                   displayName: 'Capture Outputs'
                   continueOnError: true
                   env:
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: qa-outputs
   # ========================================
@@ -906,9 +897,9 @@ stages:
       # Job 1: Plan VAL Changes
       - deployment: PlanValEnvironment
         displayName: 'Plan VAL Changes'
-        environment: 'na-val-axon-cic'
+        environment: 'na-val-cic'
         variables:
-          - group: na-val-axon-cic
+          - group: na-val-cic
         strategy:
           runOnce:
             deploy:
@@ -936,23 +927,21 @@ stages:
                     
                     cd environments/val
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "Terraform Init - VAL"
                     echo "========================================"
                     echo "Environment: $(ENVIRONMENT_NAME)"
-                    echo "State Bucket: $(TF_STATE_BUCKET)"
+                    echo "Storage Account: $(ARM_STORAGE_ACCOUNT)"
                     echo "========================================"
                     
                     terraform init \
-                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                      -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                     
                     echo "✓ Terraform initialized"
@@ -962,18 +951,18 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/val
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "Terraform Plan - VAL"
@@ -1005,9 +994,9 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: val-plan
@@ -1052,9 +1041,9 @@ stages:
       - deployment: ApplyValEnvironment
         displayName: 'Apply VAL Changes'
         dependsOn: ApproveVal
-        environment: 'na-val-axon-cic'
+        environment: 'na-val-cic'
         variables:
-          - group: na-val-axon-cic
+          - group: na-val-cic
         strategy:
           runOnce:
             deploy:
@@ -1085,17 +1074,15 @@ stages:
                     
                     cd environments/val
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     # Re-initialize Terraform
                     terraform init \
-                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                      -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                     
                     # Copy the approved plan file
@@ -1108,18 +1095,18 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/val
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "Terraform Apply - VAL"
@@ -1142,27 +1129,27 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/val
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     terraform output -json > "$(Build.ArtifactStagingDirectory)/val-outputs.json"
                     terraform output -no-color > "$(Build.ArtifactStagingDirectory)/val-outputs.txt"
                   displayName: 'Capture Terraform Outputs'
                   continueOnError: true
                   env:
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: val-outputs
@@ -1178,9 +1165,9 @@ stages:
       # Job 1: Plan PROD Changes
       - deployment: PlanProdEnvironment
         displayName: 'Plan PROD Changes'
-        environment: 'na-prod-axon-cic'
+        environment: 'na-prod-cic'
         variables:
-          - group: na-prod-axon-cic
+          - group: na-prod-cic
         strategy:
           runOnce:
             deploy:
@@ -1208,9 +1195,9 @@ stages:
                     
                     cd environments/prod
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "PRODUCTION DEPLOYMENT - INIT"
@@ -1221,11 +1208,9 @@ stages:
                     echo "========================================"
                     
                     terraform init \
-                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                      -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                     
                     echo "✓ PROD initialized"
@@ -1235,18 +1220,18 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/prod
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "PRODUCTION DEPLOYMENT - PLAN"
@@ -1277,9 +1262,9 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: prod-plan
@@ -1328,9 +1313,9 @@ stages:
       - deployment: ApplyProdEnvironment
         displayName: 'Apply PROD Changes'
         dependsOn: ApproveProd
-        environment: 'na-prod-axon-cic'
+        environment: 'na-prod-cic'
         variables:
-          - group: na-prod-axon-cic
+          - group: na-prod-cic
         strategy:
           runOnce:
             deploy:
@@ -1361,17 +1346,15 @@ stages:
                     
                     cd environments/prod
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     # Re-initialize Terraform
                     terraform init \
-                      -backend-config="bucket=$(TF_STATE_BUCKET)" \
-                      -backend-config="key=terraform.tfstate" \
-                      -backend-config="region=$(AWS_DEFAULT_REGION)" \
-                      -backend-config="use_lockfile=true" \
-                      -backend-config="encrypt=true" \
+                      -backend-config="resource_group_name=$(ARM_RESOURCE_GROUP)" \
+                      -backend-config="storage_account_name=$(ARM_STORAGE_ACCOUNT)" \
+                      -backend-config="container_name=$(ARM_CONTAINER_NAME)" \
                       -input=false -no-color
                     
                     # Copy the approved plan file
@@ -1384,18 +1367,18 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/prod
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     echo "========================================"
                     echo "PRODUCTION DEPLOYMENT - APPLY"
@@ -1420,27 +1403,27 @@ stages:
                     AUTH0_DOMAIN: $(AUTH0_DOMAIN)
                     AUTH0_CLIENT_ID: $(AUTH0_CLIENT_ID)
                     AUTH0_CLIENT_SECRET: $(AUTH0_CLIENT_SECRET)
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - script: |
                     set -euo pipefail
                     
                     cd environments/prod
                     
-                    export AWS_ACCESS_KEY_ID="$(AWS_ACCESS_KEY_ID)"
-                    export AWS_SECRET_ACCESS_KEY="$(AWS_SECRET_ACCESS_KEY)"
-                    export AWS_DEFAULT_REGION="$(AWS_DEFAULT_REGION)"
+                    export ARM_TENANT_ID="$(ARM_TENANT_ID)"
+                    export ARM_SUBSCRIPTION_ID="$(ARM_SUBSCRIPTION_ID)"
+                    export ARM_CLIENT_ID="$(ARM_CLIENT_ID)"
                     
                     terraform output -json > "$(Build.ArtifactStagingDirectory)/prod-outputs.json"
                     terraform output -no-color > "$(Build.ArtifactStagingDirectory)/prod-outputs.txt"
                   displayName: 'Step 4: Capture Outputs'
                   continueOnError: true
                   env:
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-                    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
 
                 - publish: $(Build.ArtifactStagingDirectory)
                   artifact: prod-outputs
@@ -1457,7 +1440,7 @@ stages:
                     echo "Completed: $(date -u)"
                     echo "Deployed by: $(Build.RequestedFor)"
                     echo "Terraform Version: $(TF_VERSION)"
-                    echo "State Bucket: $(TF_STATE_BUCKET)"
+                    echo "Storage Account: $(ARM_STORAGE_ACCOUNT)"
                     echo "========================================"
                     echo ""
                     echo "Next Steps:"
